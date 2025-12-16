@@ -26,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -264,6 +265,54 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
 	c.JSON(200, gin.H{"files": files})
+}
+
+// GetAuthFileModels returns the models supported by a specific auth file
+func (h *Handler) GetAuthFileModels(c *gin.Context) {
+	name := c.Query("name")
+	if name == "" {
+		c.JSON(400, gin.H{"error": "name is required"})
+		return
+	}
+
+	// Try to find auth ID via authManager
+	var authID string
+	if h.authManager != nil {
+		auths := h.authManager.List()
+		for _, auth := range auths {
+			if auth.FileName == name || auth.ID == name {
+				authID = auth.ID
+				break
+			}
+		}
+	}
+
+	if authID == "" {
+		authID = name // fallback to filename as ID
+	}
+
+	// Get models from registry
+	reg := registry.GetGlobalRegistry()
+	models := reg.GetModelsForClient(authID)
+
+	result := make([]gin.H, 0, len(models))
+	for _, m := range models {
+		entry := gin.H{
+			"id": m.ID,
+		}
+		if m.DisplayName != "" {
+			entry["display_name"] = m.DisplayName
+		}
+		if m.Type != "" {
+			entry["type"] = m.Type
+		}
+		if m.OwnedBy != "" {
+			entry["owned_by"] = m.OwnedBy
+		}
+		result = append(result, entry)
+	}
+
+	c.JSON(200, gin.H{"models": result})
 }
 
 // List auth files from disk when the auth manager is unavailable.
@@ -713,14 +762,16 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	// Generate PKCE codes
 	pkceCodes, err := claude.GeneratePKCECodes()
 	if err != nil {
-		log.Fatalf("Failed to generate PKCE codes: %v", err)
+		log.Errorf("Failed to generate PKCE codes: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate PKCE codes"})
 		return
 	}
 
 	// Generate random state parameter
 	state, err := misc.GenerateRandomState()
 	if err != nil {
-		log.Fatalf("Failed to generate state parameter: %v", err)
+		log.Errorf("Failed to generate state parameter: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state parameter"})
 		return
 	}
 
@@ -730,7 +781,8 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	// Generate authorization URL (then override redirect_uri to reuse server port)
 	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
 	if err != nil {
-		log.Fatalf("Failed to generate authorization URL: %v", err)
+		log.Errorf("Failed to generate authorization URL: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
 		return
 	}
 
@@ -872,7 +924,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
-			log.Fatalf("Failed to save authentication tokens: %v", errSave)
+			log.Errorf("Failed to save authentication tokens: %v", errSave)
 			oauthStatus[state] = "Failed to save authentication tokens"
 			return
 		}
@@ -1045,7 +1097,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		gemAuth := geminiAuth.NewGeminiAuth()
 		gemClient, errGetClient := gemAuth.GetAuthenticatedClient(ctx, &ts, h.cfg, true)
 		if errGetClient != nil {
-			log.Fatalf("failed to get authenticated client: %v", errGetClient)
+			log.Errorf("failed to get authenticated client: %v", errGetClient)
 			oauthStatus[state] = "Failed to get authenticated client"
 			return
 		}
@@ -1110,7 +1162,7 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
-			log.Fatalf("Failed to save token to file: %v", errSave)
+			log.Errorf("Failed to save token to file: %v", errSave)
 			oauthStatus[state] = "Failed to save token to file"
 			return
 		}
@@ -1131,14 +1183,16 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	// Generate PKCE codes
 	pkceCodes, err := codex.GeneratePKCECodes()
 	if err != nil {
-		log.Fatalf("Failed to generate PKCE codes: %v", err)
+		log.Errorf("Failed to generate PKCE codes: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate PKCE codes"})
 		return
 	}
 
 	// Generate random state parameter
 	state, err := misc.GenerateRandomState()
 	if err != nil {
-		log.Fatalf("Failed to generate state parameter: %v", err)
+		log.Errorf("Failed to generate state parameter: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state parameter"})
 		return
 	}
 
@@ -1148,7 +1202,8 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	// Generate authorization URL
 	authURL, err := openaiAuth.GenerateAuthURL(state, pkceCodes)
 	if err != nil {
-		log.Fatalf("Failed to generate authorization URL: %v", err)
+		log.Errorf("Failed to generate authorization URL: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
 		return
 	}
 
@@ -1283,7 +1338,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			oauthStatus[state] = "Failed to save authentication tokens"
-			log.Fatalf("Failed to save authentication tokens: %v", errSave)
+			log.Errorf("Failed to save authentication tokens: %v", errSave)
 			return
 		}
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
@@ -1318,7 +1373,8 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 
 	state, errState := misc.GenerateRandomState()
 	if errState != nil {
-		log.Fatalf("Failed to generate state parameter: %v", errState)
+		log.Errorf("Failed to generate state parameter: %v", errState)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state parameter"})
 		return
 	}
 
@@ -1514,7 +1570,7 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
-			log.Fatalf("Failed to save token to file: %v", errSave)
+			log.Errorf("Failed to save token to file: %v", errSave)
 			oauthStatus[state] = "Failed to save token to file"
 			return
 		}
@@ -1543,7 +1599,8 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 	// Generate authorization URL
 	deviceFlow, err := qwenAuth.InitiateDeviceFlow(ctx)
 	if err != nil {
-		log.Fatalf("Failed to generate authorization URL: %v", err)
+		log.Errorf("Failed to generate authorization URL: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
 		return
 	}
 	authURL := deviceFlow.VerificationURIComplete
@@ -1570,7 +1627,7 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
-			log.Fatalf("Failed to save authentication tokens: %v", errSave)
+			log.Errorf("Failed to save authentication tokens: %v", errSave)
 			oauthStatus[state] = "Failed to save authentication tokens"
 			return
 		}
@@ -1674,7 +1731,7 @@ func (h *Handler) RequestIFlowToken(c *gin.Context) {
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
 			oauthStatus[state] = "Failed to save authentication tokens"
-			log.Fatalf("Failed to save authentication tokens: %v", errSave)
+			log.Errorf("Failed to save authentication tokens: %v", errSave)
 			return
 		}
 
@@ -1714,6 +1771,17 @@ func (h *Handler) RequestIFlowCookieToken(c *gin.Context) {
 		return
 	}
 
+	// Check for duplicate BXAuth before authentication
+	bxAuth := iflowauth.ExtractBXAuth(cookieValue)
+	if existingFile, err := iflowauth.CheckDuplicateBXAuth(h.cfg.AuthDir, bxAuth); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "failed to check duplicate"})
+		return
+	} else if existingFile != "" {
+		existingFileName := filepath.Base(existingFile)
+		c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "duplicate BXAuth found", "existing_file": existingFileName})
+		return
+	}
+
 	authSvc := iflowauth.NewIFlowAuth(h.cfg)
 	tokenData, errAuth := authSvc.AuthenticateWithCookie(ctx, cookieValue)
 	if errAuth != nil {
@@ -1736,11 +1804,12 @@ func (h *Handler) RequestIFlowCookieToken(c *gin.Context) {
 	}
 
 	tokenStorage.Email = email
+	timestamp := time.Now().Unix()
 
 	record := &coreauth.Auth{
-		ID:       fmt.Sprintf("iflow-%s.json", fileName),
+		ID:       fmt.Sprintf("iflow-%s-%d.json", fileName, timestamp),
 		Provider: "iflow",
-		FileName: fmt.Sprintf("iflow-%s.json", fileName),
+		FileName: fmt.Sprintf("iflow-%s-%d.json", fileName, timestamp),
 		Storage:  tokenStorage,
 		Metadata: map[string]any{
 			"email":        email,
@@ -2103,6 +2172,7 @@ func checkCloudAPIIsEnabled(ctx context.Context, httpClient *http.Client, projec
 				continue
 			}
 		}
+		_ = resp.Body.Close()
 		return false, fmt.Errorf("project activation required: %s", errMessage)
 	}
 	return true, nil

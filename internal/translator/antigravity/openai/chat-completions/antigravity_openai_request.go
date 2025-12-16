@@ -39,42 +39,24 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 	// Note: OpenAI official fields take precedence over extra_body.google.thinking_config
 	re := gjson.GetBytes(rawJSON, "reasoning_effort")
 	hasOfficialThinking := re.Exists()
-	if hasOfficialThinking && util.ModelSupportsThinking(modelName) {
-		switch re.String() {
-		case "none":
-			out, _ = sjson.DeleteBytes(out, "request.generationConfig.thinkingConfig.include_thoughts")
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", 0)
-		case "auto":
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", -1)
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		case "low":
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", util.NormalizeThinkingBudget(modelName, 1024))
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		case "medium":
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", util.NormalizeThinkingBudget(modelName, 8192))
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		case "high":
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", util.NormalizeThinkingBudget(modelName, 32768))
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		default:
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", -1)
-			out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
-		}
+	if hasOfficialThinking && util.ModelSupportsThinking(modelName) && !util.ModelUsesThinkingLevels(modelName) {
+		out = util.ApplyReasoningEffortToGeminiCLI(out, re.String())
 	}
 
 	// Cherry Studio extension extra_body.google.thinking_config (effective only when official fields are absent)
-	if !hasOfficialThinking && util.ModelSupportsThinking(modelName) {
+	// Only apply for models that use numeric budgets, not discrete levels.
+	if !hasOfficialThinking && util.ModelSupportsThinking(modelName) && !util.ModelUsesThinkingLevels(modelName) {
 		if tc := gjson.GetBytes(rawJSON, "extra_body.google.thinking_config"); tc.Exists() && tc.IsObject() {
 			var setBudget bool
-			var normalized int
+			var budget int
 
 			if v := tc.Get("thinkingBudget"); v.Exists() {
-				normalized = util.NormalizeThinkingBudget(modelName, int(v.Int()))
-				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", normalized)
+				budget = int(v.Int())
+				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
 				setBudget = true
 			} else if v := tc.Get("thinking_budget"); v.Exists() {
-				normalized = util.NormalizeThinkingBudget(modelName, int(v.Int()))
-				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", normalized)
+				budget = int(v.Int())
+				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
 				setBudget = true
 			}
 
@@ -82,7 +64,7 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", v.Bool())
 			} else if v := tc.Get("include_thoughts"); v.Exists() {
 				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", v.Bool())
-			} else if setBudget && normalized != 0 {
+			} else if setBudget && budget != 0 {
 				out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
 			}
 		}
@@ -94,21 +76,12 @@ func ConvertOpenAIRequestToAntigravity(modelName string, inputRawJSON []byte, _ 
 		if t := gjson.GetBytes(rawJSON, "thinking"); t.Exists() && t.IsObject() {
 			if t.Get("type").String() == "enabled" {
 				if b := t.Get("budget_tokens"); b.Exists() && b.Type == gjson.Number {
-					budget := util.NormalizeThinkingBudget(modelName, int(b.Int()))
+					budget := int(b.Int())
 					out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", budget)
 					out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
 				}
 			}
 		}
-	}
-
-	// For gemini-3-pro-preview, always send default thinkingConfig when none specified.
-	// This matches the official Gemini CLI behavior which always sends:
-	// { thinkingBudget: -1, includeThoughts: true }
-	// See: ai-gemini-cli/packages/core/src/config/defaultModelConfigs.ts
-	if !gjson.GetBytes(out, "request.generationConfig.thinkingConfig").Exists() && modelName == "gemini-3-pro-preview" {
-		out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.thinkingBudget", -1)
-		out, _ = sjson.SetBytes(out, "request.generationConfig.thinkingConfig.include_thoughts", true)
 	}
 
 	// Temperature/top_p/top_k/max_tokens

@@ -5,6 +5,7 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -116,19 +117,39 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
 	return newCtx, func(params ...interface{}) {
-		if h.Cfg.RequestLog {
-			if len(params) == 1 {
-				data := params[0]
-				switch data.(type) {
-				case []byte:
-					appendAPIResponse(c, data.([]byte))
-				case error:
-					appendAPIResponse(c, []byte(data.(error).Error()))
-				case string:
-					appendAPIResponse(c, []byte(data.(string)))
-				case bool:
-				case nil:
+		if h.Cfg.RequestLog && len(params) == 1 {
+			if existing, exists := c.Get("API_RESPONSE"); exists {
+				if existingBytes, ok := existing.([]byte); ok && len(bytes.TrimSpace(existingBytes)) > 0 {
+					switch params[0].(type) {
+					case error, string:
+						cancel()
+						return
+					}
 				}
+			}
+
+			var payload []byte
+			switch data := params[0].(type) {
+			case []byte:
+				payload = data
+			case error:
+				if data != nil {
+					payload = []byte(data.Error())
+				}
+			case string:
+				payload = []byte(data)
+			}
+			if len(payload) > 0 {
+				if existing, exists := c.Get("API_RESPONSE"); exists {
+					if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
+						trimmedPayload := bytes.TrimSpace(payload)
+						if len(trimmedPayload) > 0 && bytes.Contains(existingBytes, trimmedPayload) {
+							cancel()
+							return
+						}
+					}
+				}
+				appendAPIResponse(c, payload)
 			}
 		}
 
@@ -323,18 +344,32 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 
 	providerName, extractedModelName, isDynamic := h.parseDynamicModel(resolvedModelName)
 
-	// First, normalize the model name to handle suffixes like "-thinking-128"
-	// This needs to happen before determining the provider for non-dynamic models.
-	normalizedModel, metadata = normalizeModelMetadata(resolvedModelName)
+	targetModelName := resolvedModelName
+	if isDynamic {
+		targetModelName = extractedModelName
+	}
+
+	// Normalize the model name to handle dynamic thinking suffixes before determining the provider.
+	normalizedModel, metadata = normalizeModelMetadata(targetModelName)
 
 	if isDynamic {
 		providers = []string{providerName}
-		// For dynamic models, the extractedModelName is already normalized by parseDynamicModel
-		// so we use it as the final normalizedModel.
-		normalizedModel = extractedModelName
 	} else {
 		// For non-dynamic models, use the normalizedModel to get the provider name.
 		providers = util.GetProviderName(normalizedModel)
+		if len(providers) == 0 && metadata != nil {
+			if originalRaw, ok := metadata[util.ThinkingOriginalModelMetadataKey]; ok {
+				if originalModel, okStr := originalRaw.(string); okStr {
+					originalModel = strings.TrimSpace(originalModel)
+					if originalModel != "" && !strings.EqualFold(originalModel, normalizedModel) {
+						if altProviders := util.GetProviderName(originalModel); len(altProviders) > 0 {
+							providers = altProviders
+							normalizedModel = originalModel
+						}
+					}
+				}
+			}
+		}
 	}
 
 	if len(providers) == 0 {
@@ -382,7 +417,7 @@ func cloneBytes(src []byte) []byte {
 }
 
 func normalizeModelMetadata(modelName string) (string, map[string]any) {
-	return util.NormalizeGeminiThinkingModel(modelName)
+	return util.NormalizeThinkingModel(modelName)
 }
 
 func cloneMetadata(src map[string]any) map[string]any {
@@ -413,12 +448,53 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 			}
 		}
 	}
-	c.Status(status)
+
+	errText := http.StatusText(status)
 	if msg != nil && msg.Error != nil {
-		_, _ = c.Writer.Write([]byte(msg.Error.Error()))
-	} else {
-		_, _ = c.Writer.Write([]byte(http.StatusText(status)))
+		if v := strings.TrimSpace(msg.Error.Error()); v != "" {
+			errText = v
+		}
 	}
+
+	// Prefer preserving upstream JSON error bodies when possible.
+	buildJSONBody := func() []byte {
+		trimmed := strings.TrimSpace(errText)
+		if trimmed != "" && json.Valid([]byte(trimmed)) {
+			return []byte(trimmed)
+		}
+		errType := "invalid_request_error"
+		switch status {
+		case http.StatusUnauthorized:
+			errType = "authentication_error"
+		case http.StatusForbidden:
+			errType = "permission_error"
+		case http.StatusTooManyRequests:
+			errType = "rate_limit_error"
+		default:
+			if status >= http.StatusInternalServerError {
+				errType = "server_error"
+			}
+		}
+		payload, err := json.Marshal(ErrorResponse{
+			Error: ErrorDetail{
+				Message: errText,
+				Type:    errType,
+			},
+		})
+		if err != nil {
+			return []byte(fmt.Sprintf(`{"error":{"message":%q,"type":"server_error"}}`, errText))
+		}
+		return payload
+	}
+
+	body := buildJSONBody()
+	c.Set("API_RESPONSE", bytes.Clone(body))
+
+	if !c.Writer.Written() {
+		c.Writer.Header().Set("Content-Type", "application/json")
+	}
+	c.Status(status)
+	_, _ = c.Writer.Write(body)
 }
 
 func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *interfaces.ErrorMessage) {
