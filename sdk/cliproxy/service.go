@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -23,6 +22,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -506,6 +506,13 @@ func (s *Service) Run(ctx context.Context) error {
 
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
+		previousStrategy := ""
+		s.cfgMu.RLock()
+		if s.cfg != nil {
+			previousStrategy = strings.ToLower(strings.TrimSpace(s.cfg.Routing.Strategy))
+		}
+		s.cfgMu.RUnlock()
+
 		if newCfg == nil {
 			s.cfgMu.RLock()
 			newCfg = s.cfg
@@ -514,6 +521,30 @@ func (s *Service) Run(ctx context.Context) error {
 		if newCfg == nil {
 			return
 		}
+
+		nextStrategy := strings.ToLower(strings.TrimSpace(newCfg.Routing.Strategy))
+		normalizeStrategy := func(strategy string) string {
+			switch strategy {
+			case "fill-first", "fillfirst", "ff":
+				return "fill-first"
+			default:
+				return "round-robin"
+			}
+		}
+		previousStrategy = normalizeStrategy(previousStrategy)
+		nextStrategy = normalizeStrategy(nextStrategy)
+		if s.coreManager != nil && previousStrategy != nextStrategy {
+			var selector coreauth.Selector
+			switch nextStrategy {
+			case "fill-first":
+				selector = &coreauth.FillFirstSelector{}
+			default:
+				selector = &coreauth.RoundRobinSelector{}
+			}
+			s.coreManager.SetSelector(selector)
+			log.Infof("routing strategy updated to %s", nextStrategy)
+		}
+
 		s.applyRetryConfig(newCfg)
 		if s.server != nil {
 			s.server.UpdateClients(newCfg)
@@ -521,6 +552,9 @@ func (s *Service) Run(ctx context.Context) error {
 		s.cfgMu.Lock()
 		s.cfg = newCfg
 		s.cfgMu.Unlock()
+		if s.coreManager != nil {
+			s.coreManager.SetOAuthModelMappings(newCfg.OAuthModelMappings)
+		}
 		s.rebindExecutors()
 	}
 
@@ -646,6 +680,11 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		return
 	}
 	authKind := strings.ToLower(strings.TrimSpace(a.Attributes["auth_kind"]))
+	if authKind == "" {
+		if kind, _ := a.AccountInfo(); strings.EqualFold(kind, "api_key") {
+			authKind = "apikey"
+		}
+	}
 	if a.Attributes != nil {
 		if v := strings.TrimSpace(a.Attributes["gemini_virtual_primary"]); strings.EqualFold(v, "true") {
 			GlobalModelRegistry().UnregisterClient(a.ID)
@@ -671,6 +710,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "gemini":
 		models = registry.GetGeminiModels()
 		if entry := s.resolveConfigGeminiKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildGeminiConfigModels(entry)
+			}
 			if authKind == "apikey" {
 				excluded = entry.ExcludedModels
 			}
@@ -710,6 +752,9 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 	case "codex":
 		models = registry.GetOpenAIModels()
 		if entry := s.resolveConfigCodexKey(a); entry != nil {
+			if len(entry.Models) > 0 {
+				models = buildCodexConfigModels(entry)
+			}
 			if authKind == "apikey" {
 				excluded = entry.ExcludedModels
 			}
@@ -787,7 +832,7 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 						if providerKey == "" {
 							providerKey = "openai-compatibility"
 						}
-						GlobalModelRegistry().RegisterClient(a.ID, providerKey, ms)
+						GlobalModelRegistry().RegisterClient(a.ID, providerKey, applyModelPrefixes(ms, a.Prefix, s.cfg.ForceModelPrefix))
 					} else {
 						// Ensure stale registrations are cleared when model list becomes empty.
 						GlobalModelRegistry().UnregisterClient(a.ID)
@@ -802,12 +847,13 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 			}
 		}
 	}
+	models = applyOAuthModelMappings(s.cfg, provider, authKind, models)
 	if len(models) > 0 {
 		key := provider
 		if key == "" {
 			key = strings.ToLower(strings.TrimSpace(a.Provider))
 		}
-		GlobalModelRegistry().RegisterClient(a.ID, key, models)
+		GlobalModelRegistry().RegisterClient(a.ID, key, applyModelPrefixes(models, a.Prefix, s.cfg != nil && s.cfg.ForceModelPrefix))
 		return
 	}
 
@@ -987,6 +1033,48 @@ func applyExcludedModels(models []*ModelInfo, excluded []string) []*ModelInfo {
 	return filtered
 }
 
+func applyModelPrefixes(models []*ModelInfo, prefix string, forceModelPrefix bool) []*ModelInfo {
+	trimmedPrefix := strings.TrimSpace(prefix)
+	if trimmedPrefix == "" || len(models) == 0 {
+		return models
+	}
+
+	out := make([]*ModelInfo, 0, len(models)*2)
+	seen := make(map[string]struct{}, len(models)*2)
+
+	addModel := func(model *ModelInfo) {
+		if model == nil {
+			return
+		}
+		id := strings.TrimSpace(model.ID)
+		if id == "" {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, model)
+	}
+
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		baseID := strings.TrimSpace(model.ID)
+		if baseID == "" {
+			continue
+		}
+		if !forceModelPrefix || trimmedPrefix == baseID {
+			addModel(model)
+		}
+		clone := *model
+		clone.ID = trimmedPrefix + "/" + baseID
+		addModel(&clone)
+	}
+	return out
+}
+
 // matchWildcard performs case-insensitive wildcard matching where '*' matches any substring.
 func matchWildcard(pattern, value string) bool {
 	if pattern == "" {
@@ -1031,17 +1119,22 @@ func matchWildcard(pattern, value string) bool {
 	return true
 }
 
-func buildVertexCompatConfigModels(entry *config.VertexCompatKey) []*ModelInfo {
-	if entry == nil || len(entry.Models) == 0 {
+type modelEntry interface {
+	GetName() string
+	GetAlias() string
+}
+
+func buildConfigModels[T modelEntry](models []T, ownedBy, modelType string) []*ModelInfo {
+	if len(models) == 0 {
 		return nil
 	}
 	now := time.Now().Unix()
-	out := make([]*ModelInfo, 0, len(entry.Models))
-	seen := make(map[string]struct{}, len(entry.Models))
-	for i := range entry.Models {
-		model := entry.Models[i]
-		name := strings.TrimSpace(model.Name)
-		alias := strings.TrimSpace(model.Alias)
+	out := make([]*ModelInfo, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for i := range models {
+		model := models[i]
+		name := strings.TrimSpace(model.GetName())
+		alias := strings.TrimSpace(model.GetAlias())
 		if alias == "" {
 			alias = name
 		}
@@ -1057,52 +1150,176 @@ func buildVertexCompatConfigModels(entry *config.VertexCompatKey) []*ModelInfo {
 		if display == "" {
 			display = alias
 		}
-		out = append(out, &ModelInfo{
+		info := &ModelInfo{
 			ID:          alias,
 			Object:      "model",
 			Created:     now,
-			OwnedBy:     "vertex",
-			Type:        "vertex",
+			OwnedBy:     ownedBy,
+			Type:        modelType,
 			DisplayName: display,
-		})
+		}
+		if name != "" {
+			if upstream := registry.LookupStaticModelInfo(name); upstream != nil && upstream.Thinking != nil {
+				info.Thinking = upstream.Thinking
+			}
+		}
+		out = append(out, info)
 	}
 	return out
 }
 
-func buildClaudeConfigModels(entry *config.ClaudeKey) []*ModelInfo {
-	if entry == nil || len(entry.Models) == 0 {
+func buildVertexCompatConfigModels(entry *config.VertexCompatKey) []*ModelInfo {
+	if entry == nil {
 		return nil
 	}
-	now := time.Now().Unix()
-	out := make([]*ModelInfo, 0, len(entry.Models))
-	seen := make(map[string]struct{}, len(entry.Models))
-	for i := range entry.Models {
-		model := entry.Models[i]
-		name := strings.TrimSpace(model.Name)
-		alias := strings.TrimSpace(model.Alias)
-		if alias == "" {
-			alias = name
-		}
-		if alias == "" {
+	return buildConfigModels(entry.Models, "google", "vertex")
+}
+
+func buildGeminiConfigModels(entry *config.GeminiKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "google", "gemini")
+}
+
+func buildClaudeConfigModels(entry *config.ClaudeKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "anthropic", "claude")
+}
+
+func buildCodexConfigModels(entry *config.CodexKey) []*ModelInfo {
+	if entry == nil {
+		return nil
+	}
+	return buildConfigModels(entry.Models, "openai", "openai")
+}
+
+func rewriteModelInfoName(name, oldID, newID string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return name
+	}
+	oldID = strings.TrimSpace(oldID)
+	newID = strings.TrimSpace(newID)
+	if oldID == "" || newID == "" {
+		return name
+	}
+	if strings.EqualFold(oldID, newID) {
+		return name
+	}
+	if strings.HasSuffix(trimmed, "/"+oldID) {
+		prefix := strings.TrimSuffix(trimmed, oldID)
+		return prefix + newID
+	}
+	if trimmed == "models/"+oldID {
+		return "models/" + newID
+	}
+	return name
+}
+
+func applyOAuthModelMappings(cfg *config.Config, provider, authKind string, models []*ModelInfo) []*ModelInfo {
+	if cfg == nil || len(models) == 0 {
+		return models
+	}
+	channel := coreauth.OAuthModelMappingChannel(provider, authKind)
+	if channel == "" || len(cfg.OAuthModelMappings) == 0 {
+		return models
+	}
+	mappings := cfg.OAuthModelMappings[channel]
+	if len(mappings) == 0 {
+		return models
+	}
+
+	type mappingEntry struct {
+		alias string
+		fork  bool
+	}
+
+	forward := make(map[string]mappingEntry, len(mappings))
+	for i := range mappings {
+		name := strings.TrimSpace(mappings[i].Name)
+		alias := strings.TrimSpace(mappings[i].Alias)
+		if name == "" || alias == "" {
 			continue
 		}
-		key := strings.ToLower(alias)
-		if _, exists := seen[key]; exists {
+		if strings.EqualFold(name, alias) {
 			continue
 		}
-		seen[key] = struct{}{}
-		display := name
-		if display == "" {
-			display = alias
+		key := strings.ToLower(name)
+		if _, exists := forward[key]; exists {
+			continue
 		}
-		out = append(out, &ModelInfo{
-			ID:          alias,
-			Object:      "model",
-			Created:     now,
-			OwnedBy:     "claude",
-			Type:        "claude",
-			DisplayName: display,
-		})
+		forward[key] = mappingEntry{alias: alias, fork: mappings[i].Fork}
+	}
+	if len(forward) == 0 {
+		return models
+	}
+	out := make([]*ModelInfo, 0, len(models))
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		id := strings.TrimSpace(model.ID)
+		if id == "" {
+			continue
+		}
+		key := strings.ToLower(id)
+		entry, ok := forward[key]
+		if !ok {
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, model)
+			continue
+		}
+		mappedID := strings.TrimSpace(entry.alias)
+		if mappedID == "" {
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, model)
+			continue
+		}
+
+		if entry.fork {
+			if _, exists := seen[key]; !exists {
+				seen[key] = struct{}{}
+				out = append(out, model)
+			}
+			aliasKey := strings.ToLower(mappedID)
+			if _, exists := seen[aliasKey]; exists {
+				continue
+			}
+			seen[aliasKey] = struct{}{}
+			clone := *model
+			clone.ID = mappedID
+			if clone.Name != "" {
+				clone.Name = rewriteModelInfoName(clone.Name, id, mappedID)
+			}
+			out = append(out, &clone)
+			continue
+		}
+
+		uniqueKey := strings.ToLower(mappedID)
+		if _, exists := seen[uniqueKey]; exists {
+			continue
+		}
+		seen[uniqueKey] = struct{}{}
+		if mappedID == id {
+			out = append(out, model)
+			continue
+		}
+		clone := *model
+		clone.ID = mappedID
+		if clone.Name != "" {
+			clone.Name = rewriteModelInfoName(clone.Name, id, mappedID)
+		}
+		out = append(out, &clone)
 	}
 	return out
 }

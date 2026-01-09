@@ -12,7 +12,6 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 )
@@ -21,7 +20,7 @@ const DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy
 
 // Config represents the application's configuration, loaded from a YAML file.
 type Config struct {
-	config.SDKConfig `yaml:",inline"`
+	SDKConfig `yaml:",inline"`
 	// Host is the network host/interface on which the API server will bind.
 	// Default is empty ("") to bind all interfaces (IPv4 + IPv6). Use "127.0.0.1" or "localhost" for local-only access.
 	Host string `yaml:"host" json:"-"`
@@ -40,8 +39,15 @@ type Config struct {
 	// Debug enables or disables debug-level logging and other debug features.
 	Debug bool `yaml:"debug" json:"debug"`
 
+	// CommercialMode disables high-overhead HTTP middleware features to minimize per-request memory usage.
+	CommercialMode bool `yaml:"commercial-mode" json:"commercial-mode"`
+
 	// LoggingToFile controls whether application logs are written to rotating files or stdout.
 	LoggingToFile bool `yaml:"logging-to-file" json:"logging-to-file"`
+
+	// LogsMaxTotalSizeMB limits the total size (in MB) of log files under the logs directory.
+	// When exceeded, the oldest log files are deleted until within the limit. Set to 0 to disable.
+	LogsMaxTotalSizeMB int `yaml:"logs-max-total-size-mb" json:"logs-max-total-size-mb"`
 
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
@@ -56,6 +62,9 @@ type Config struct {
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
+
+	// Routing controls credential selection behavior.
+	Routing RoutingConfig `yaml:"routing" json:"routing"`
 
 	// WebsocketAuth enables or disables authentication for the WebSocket API.
 	WebsocketAuth bool `yaml:"ws-auth" json:"ws-auth"`
@@ -81,6 +90,14 @@ type Config struct {
 
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
+
+	// OAuthModelMappings defines global model name mappings for OAuth/file-backed auth channels.
+	// These mappings affect both model listing and model routing for supported channels:
+	// gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow.
+	//
+	// NOTE: This does not apply to existing per-credential model alias features under:
+	// gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, and ampcode.
+	OAuthModelMappings map[string][]ModelNameMapping `yaml:"oauth-model-mappings,omitempty" json:"oauth-model-mappings,omitempty"`
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
@@ -121,6 +138,23 @@ type QuotaExceeded struct {
 	SwitchPreviewModel bool `yaml:"switch-preview-model" json:"switch-preview-model"`
 }
 
+// RoutingConfig configures how credentials are selected for requests.
+type RoutingConfig struct {
+	// Strategy selects the credential selection strategy.
+	// Supported values: "round-robin" (default), "fill-first".
+	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+}
+
+// ModelNameMapping defines a model ID mapping for a specific channel.
+// It maps the upstream model name (Name) to the client-visible alias (Alias).
+// When Fork is true, the alias is added as an additional model in listings while
+// keeping the original model ID available.
+type ModelNameMapping struct {
+	Name  string `yaml:"name" json:"name"`
+	Alias string `yaml:"alias" json:"alias"`
+	Fork  bool   `yaml:"fork,omitempty" json:"fork,omitempty"`
+}
+
 // AmpModelMapping defines a model name mapping for Amp CLI requests.
 // When Amp requests a model that isn't available locally, this mapping
 // allows routing to an alternative model that IS available.
@@ -131,6 +165,11 @@ type AmpModelMapping struct {
 	// To is the target model name to route to (e.g., "claude-sonnet-4").
 	// The target model must have available providers in the registry.
 	To string `yaml:"to" json:"to"`
+
+	// Regex indicates whether the 'from' field should be interpreted as a regular
+	// expression for matching model names. When true, this mapping is evaluated
+	// after exact matches and in the order provided. Defaults to false (exact match).
+	Regex bool `yaml:"regex,omitempty" json:"regex,omitempty"`
 }
 
 // AmpCode groups Amp CLI integration settings including upstream routing,
@@ -141,6 +180,11 @@ type AmpCode struct {
 
 	// UpstreamAPIKey optionally overrides the Authorization header when proxying Amp upstream calls.
 	UpstreamAPIKey string `yaml:"upstream-api-key" json:"upstream-api-key"`
+
+	// UpstreamAPIKeys maps client API keys (from top-level api-keys) to upstream API keys.
+	// When a client authenticates with a key that matches an entry, that upstream key is used.
+	// If no match is found, falls back to UpstreamAPIKey (default behavior).
+	UpstreamAPIKeys []AmpUpstreamAPIKeyEntry `yaml:"upstream-api-keys,omitempty" json:"upstream-api-keys,omitempty"`
 
 	// RestrictManagementToLocalhost restricts Amp management routes (/api/user, /api/threads, etc.)
 	// to only accept connections from localhost (127.0.0.1, ::1). When true, prevents drive-by
@@ -155,6 +199,17 @@ type AmpCode struct {
 	// ForceModelMappings when true, model mappings take precedence over local API keys.
 	// When false (default), local API keys are used first if available.
 	ForceModelMappings bool `yaml:"force-model-mappings" json:"force-model-mappings"`
+}
+
+// AmpUpstreamAPIKeyEntry maps a set of client API keys to a specific upstream API key.
+// When a request is authenticated with one of the APIKeys, the corresponding UpstreamAPIKey
+// is used for the upstream Amp request.
+type AmpUpstreamAPIKeyEntry struct {
+	// UpstreamAPIKey is the API key to use when proxying to the Amp upstream.
+	UpstreamAPIKey string `yaml:"upstream-api-key" json:"upstream-api-key"`
+
+	// APIKeys are the client API keys (from top-level api-keys) that map to this upstream key.
+	APIKeys []string `yaml:"api-keys" json:"api-keys"`
 }
 
 // PayloadConfig defines default and override parameter rules applied to provider payloads.
@@ -187,6 +242,9 @@ type ClaudeKey struct {
 	// APIKey is the authentication key for accessing Claude API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
+	// Prefix optionally namespaces models for this credential (e.g., "teamA/claude-sonnet-4").
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
+
 	// BaseURL is the base URL for the Claude API endpoint.
 	// If empty, the default Claude API URL will be used.
 	BaseURL string `yaml:"base-url" json:"base-url"`
@@ -213,11 +271,17 @@ type ClaudeModel struct {
 	Alias string `yaml:"alias" json:"alias"`
 }
 
+func (m ClaudeModel) GetName() string  { return m.Name }
+func (m ClaudeModel) GetAlias() string { return m.Alias }
+
 // CodexKey represents the configuration for a Codex API key,
 // including the API key itself and an optional base URL for the API endpoint.
 type CodexKey struct {
 	// APIKey is the authentication key for accessing Codex API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
+
+	// Prefix optionally namespaces models for this credential (e.g., "teamA/gpt-5-codex").
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 
 	// BaseURL is the base URL for the Codex API endpoint.
 	// If empty, the default Codex API URL will be used.
@@ -226,12 +290,27 @@ type CodexKey struct {
 	// ProxyURL overrides the global proxy setting for this API key if provided.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// Models defines upstream model names and aliases for request routing.
+	Models []CodexModel `yaml:"models" json:"models"`
+
 	// Headers optionally adds extra HTTP headers for requests sent with this key.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
 
 	// ExcludedModels lists model IDs that should be excluded for this provider.
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
 }
+
+// CodexModel describes a mapping between an alias and the actual upstream model name.
+type CodexModel struct {
+	// Name is the upstream model identifier used when issuing requests.
+	Name string `yaml:"name" json:"name"`
+
+	// Alias is the client-facing model name that maps to Name.
+	Alias string `yaml:"alias" json:"alias"`
+}
+
+func (m CodexModel) GetName() string  { return m.Name }
+func (m CodexModel) GetAlias() string { return m.Alias }
 
 // GeminiKey represents the configuration for a Gemini API key,
 // including optional overrides for upstream base URL, proxy routing, and headers.
@@ -239,11 +318,17 @@ type GeminiKey struct {
 	// APIKey is the authentication key for accessing Gemini API services.
 	APIKey string `yaml:"api-key" json:"api-key"`
 
+	// Prefix optionally namespaces models for this credential (e.g., "teamA/gemini-3-pro-preview").
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
+
 	// BaseURL optionally overrides the Gemini API endpoint.
 	BaseURL string `yaml:"base-url,omitempty" json:"base-url,omitempty"`
 
 	// ProxyURL optionally overrides the global proxy for this API key.
 	ProxyURL string `yaml:"proxy-url,omitempty" json:"proxy-url,omitempty"`
+
+	// Models defines upstream model names and aliases for request routing.
+	Models []GeminiModel `yaml:"models,omitempty" json:"models,omitempty"`
 
 	// Headers optionally adds extra HTTP headers for requests sent with this key.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
@@ -252,11 +337,26 @@ type GeminiKey struct {
 	ExcludedModels []string `yaml:"excluded-models,omitempty" json:"excluded-models,omitempty"`
 }
 
+// GeminiModel describes a mapping between an alias and the actual upstream model name.
+type GeminiModel struct {
+	// Name is the upstream model identifier used when issuing requests.
+	Name string `yaml:"name" json:"name"`
+
+	// Alias is the client-facing model name that maps to Name.
+	Alias string `yaml:"alias" json:"alias"`
+}
+
+func (m GeminiModel) GetName() string  { return m.Name }
+func (m GeminiModel) GetAlias() string { return m.Alias }
+
 // OpenAICompatibility represents the configuration for OpenAI API compatibility
 // with external providers, allowing model aliases to be routed through OpenAI API format.
 type OpenAICompatibility struct {
 	// Name is the identifier for this OpenAI compatibility configuration.
 	Name string `yaml:"name" json:"name"`
+
+	// Prefix optionally namespaces model aliases for this provider (e.g., "teamA/kimi-k2").
+	Prefix string `yaml:"prefix,omitempty" json:"prefix,omitempty"`
 
 	// BaseURL is the base URL for the external OpenAI-compatible API endpoint.
 	BaseURL string `yaml:"base-url" json:"base-url"`
@@ -330,6 +430,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Set defaults before unmarshal so that absent keys keep defaults.
 	cfg.Host = "" // Default empty: binds to all interfaces (IPv4 + IPv6)
 	cfg.LoggingToFile = false
+	cfg.LogsMaxTotalSizeMB = 0
 	cfg.UsageStatisticsEnabled = false
 	cfg.DisableCooling = false
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
@@ -374,6 +475,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 		cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	}
 
+	if cfg.LogsMaxTotalSizeMB < 0 {
+		cfg.LogsMaxTotalSizeMB = 0
+	}
+
 	// Sync request authentication providers with inline API keys for backwards compatibility.
 	syncInlineAccessProvider(&cfg)
 
@@ -395,6 +500,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
 
+	// Normalize global OAuth model name mappings.
+	cfg.SanitizeOAuthModelMappings()
+
 	if cfg.legacyMigrationPending {
 		fmt.Println("Detected legacy configuration keys, attempting to persist the normalized config...")
 		if !optional && configFile != "" {
@@ -411,6 +519,50 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	return &cfg, nil
 }
 
+// SanitizeOAuthModelMappings normalizes and deduplicates global OAuth model name mappings.
+// It trims whitespace, normalizes channel keys to lower-case, drops empty entries,
+// and ensures (From, To) pairs are unique within each channel.
+func (cfg *Config) SanitizeOAuthModelMappings() {
+	if cfg == nil || len(cfg.OAuthModelMappings) == 0 {
+		return
+	}
+	out := make(map[string][]ModelNameMapping, len(cfg.OAuthModelMappings))
+	for rawChannel, mappings := range cfg.OAuthModelMappings {
+		channel := strings.ToLower(strings.TrimSpace(rawChannel))
+		if channel == "" || len(mappings) == 0 {
+			continue
+		}
+		seenName := make(map[string]struct{}, len(mappings))
+		seenAlias := make(map[string]struct{}, len(mappings))
+		clean := make([]ModelNameMapping, 0, len(mappings))
+		for _, mapping := range mappings {
+			name := strings.TrimSpace(mapping.Name)
+			alias := strings.TrimSpace(mapping.Alias)
+			if name == "" || alias == "" {
+				continue
+			}
+			if strings.EqualFold(name, alias) {
+				continue
+			}
+			nameKey := strings.ToLower(name)
+			aliasKey := strings.ToLower(alias)
+			if _, ok := seenName[nameKey]; ok {
+				continue
+			}
+			if _, ok := seenAlias[aliasKey]; ok {
+				continue
+			}
+			seenName[nameKey] = struct{}{}
+			seenAlias[aliasKey] = struct{}{}
+			clean = append(clean, ModelNameMapping{Name: name, Alias: alias, Fork: mapping.Fork})
+		}
+		if len(clean) > 0 {
+			out[channel] = clean
+		}
+	}
+	cfg.OAuthModelMappings = out
+}
+
 // SanitizeOpenAICompatibility removes OpenAI-compatibility provider entries that are
 // not actionable, specifically those missing a BaseURL. It trims whitespace before
 // evaluation and preserves the relative order of remaining entries.
@@ -422,6 +574,7 @@ func (cfg *Config) SanitizeOpenAICompatibility() {
 	for i := range cfg.OpenAICompatibility {
 		e := cfg.OpenAICompatibility[i]
 		e.Name = strings.TrimSpace(e.Name)
+		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
 		if e.BaseURL == "" {
@@ -442,6 +595,7 @@ func (cfg *Config) SanitizeCodexKeys() {
 	out := make([]CodexKey, 0, len(cfg.CodexKey))
 	for i := range cfg.CodexKey {
 		e := cfg.CodexKey[i]
+		e.Prefix = normalizeModelPrefix(e.Prefix)
 		e.BaseURL = strings.TrimSpace(e.BaseURL)
 		e.Headers = NormalizeHeaders(e.Headers)
 		e.ExcludedModels = NormalizeExcludedModels(e.ExcludedModels)
@@ -460,6 +614,7 @@ func (cfg *Config) SanitizeClaudeKeys() {
 	}
 	for i := range cfg.ClaudeKey {
 		entry := &cfg.ClaudeKey[i]
+		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.Headers = NormalizeHeaders(entry.Headers)
 		entry.ExcludedModels = NormalizeExcludedModels(entry.ExcludedModels)
 	}
@@ -479,6 +634,7 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		if entry.APIKey == "" {
 			continue
 		}
+		entry.Prefix = normalizeModelPrefix(entry.Prefix)
 		entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 		entry.ProxyURL = strings.TrimSpace(entry.ProxyURL)
 		entry.Headers = NormalizeHeaders(entry.Headers)
@@ -490,6 +646,18 @@ func (cfg *Config) SanitizeGeminiKeys() {
 		out = append(out, entry)
 	}
 	cfg.GeminiKey = out
+}
+
+func normalizeModelPrefix(prefix string) string {
+	trimmed := strings.TrimSpace(prefix)
+	trimmed = strings.Trim(trimmed, "/")
+	if trimmed == "" {
+		return ""
+	}
+	if strings.Contains(trimmed, "/") {
+		return ""
+	}
+	return trimmed
 }
 
 func syncInlineAccessProvider(cfg *Config) {
@@ -664,7 +832,7 @@ func sanitizeConfigForPersist(cfg *Config) *Config {
 	}
 	clone := *cfg
 	clone.SDKConfig = cfg.SDKConfig
-	clone.SDKConfig.Access = config.AccessConfig{}
+	clone.SDKConfig.Access = AccessConfig{}
 	return &clone
 }
 
@@ -763,8 +931,8 @@ func getOrCreateMapValue(mapNode *yaml.Node, key string) *yaml.Node {
 }
 
 // mergeMappingPreserve merges keys from src into dst mapping node while preserving
-// key order and comments of existing keys in dst. Unknown keys from src are appended
-// to dst at the end, copying their node structure from src.
+// key order and comments of existing keys in dst. New keys are only added if their
+// value is non-zero to avoid polluting the config with defaults.
 func mergeMappingPreserve(dst, src *yaml.Node) {
 	if dst == nil || src == nil {
 		return
@@ -775,20 +943,19 @@ func mergeMappingPreserve(dst, src *yaml.Node) {
 		copyNodeShallow(dst, src)
 		return
 	}
-	// Build a lookup of existing keys in dst
 	for i := 0; i+1 < len(src.Content); i += 2 {
 		sk := src.Content[i]
 		sv := src.Content[i+1]
 		idx := findMapKeyIndex(dst, sk.Value)
 		if idx >= 0 {
-			// Merge into existing value node
+			// Merge into existing value node (always update, even to zero values)
 			dv := dst.Content[idx+1]
 			mergeNodePreserve(dv, sv)
 		} else {
-			if shouldSkipEmptyCollectionOnPersist(sk.Value, sv) {
+			// New key: only add if value is non-zero to avoid polluting config with defaults
+			if isZeroValueNode(sv) {
 				continue
 			}
-			// Append new key/value pair by deep-copying from src
 			dst.Content = append(dst.Content, deepCopyNode(sk), deepCopyNode(sv))
 		}
 	}
@@ -871,32 +1038,49 @@ func findMapKeyIndex(mapNode *yaml.Node, key string) int {
 	return -1
 }
 
-func shouldSkipEmptyCollectionOnPersist(key string, node *yaml.Node) bool {
-	switch key {
-	case "generative-language-api-key",
-		"gemini-api-key",
-		"vertex-api-key",
-		"claude-api-key",
-		"codex-api-key",
-		"openai-compatibility":
-		return isEmptyCollectionNode(node)
-	default:
-		return false
-	}
-}
-
-func isEmptyCollectionNode(node *yaml.Node) bool {
+// isZeroValueNode returns true if the YAML node represents a zero/default value
+// that should not be written as a new key to preserve config cleanliness.
+// For mappings and sequences, recursively checks if all children are zero values.
+func isZeroValueNode(node *yaml.Node) bool {
 	if node == nil {
 		return true
 	}
 	switch node.Kind {
-	case yaml.SequenceNode:
-		return len(node.Content) == 0
 	case yaml.ScalarNode:
-		return node.Tag == "!!null"
-	default:
-		return false
+		switch node.Tag {
+		case "!!bool":
+			return node.Value == "false"
+		case "!!int", "!!float":
+			return node.Value == "0" || node.Value == "0.0"
+		case "!!str":
+			return node.Value == ""
+		case "!!null":
+			return true
+		}
+	case yaml.SequenceNode:
+		if len(node.Content) == 0 {
+			return true
+		}
+		// Check if all elements are zero values
+		for _, child := range node.Content {
+			if !isZeroValueNode(child) {
+				return false
+			}
+		}
+		return true
+	case yaml.MappingNode:
+		if len(node.Content) == 0 {
+			return true
+		}
+		// Check if all values are zero values (values are at odd indices)
+		for i := 1; i < len(node.Content); i += 2 {
+			if !isZeroValueNode(node.Content[i]) {
+				return false
+			}
+		}
+		return true
 	}
+	return false
 }
 
 // deepCopyNode creates a deep copy of a yaml.Node graph.
